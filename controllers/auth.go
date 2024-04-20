@@ -1,13 +1,18 @@
 package controllers
 
 import (
-	"github.com/gin-gonic/gin"
+	"errors"
+	"github.com/go-playground/validator/v10"
 	"whop-core-go/db"
 	"whop-core-go/models"
 
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"net/http"
+
 	"github.com/golang-jwt/jwt"
 	"golang.org/x/crypto/bcrypt"
-	"net/http"
 
 	"os"
 	"time"
@@ -17,7 +22,7 @@ type Auth struct {
 }
 
 type RequestBody struct {
-	Email    string `form:"email" json:"email"`
+	Email    string `form:"email" json:"email" binding:"required,email"`
 	Password string `form:"password" json:"password"`
 }
 
@@ -31,47 +36,104 @@ type ResponseData struct {
 	AccessToken string `json:"accessToken"`
 }
 
-type Response struct {
+type ResponseSuccess struct {
 	Status  bool         `json:"status"`
 	Message string       `json:"message"`
 	Data    ResponseData `json:"data"`
 }
 
+type ResponseFailed struct {
+	Status  bool   `json:"status"`
+	Message string `json:"message"`
+}
+
+type ErrorMsg struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
+func getErrorMsg(fe validator.FieldError) string {
+	switch fe.Tag() {
+	case "required":
+		return "This field is required"
+	case "lte":
+		return "Should be less than " + fe.Param()
+	case "gte":
+		return "Should be greater than " + fe.Param()
+	}
+	return "Unknown error"
+}
+
 func (auth Auth) Login(ctx *gin.Context) {
 
 	var request RequestBody
+	var isValidUser bool = true
+	var jwtToken string
+
 	err := ctx.ShouldBind(&request)
 
 	if err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+
+		var ve validator.ValidationErrors
+		if errors.As(err, &ve) {
+			out := make([]ErrorMsg, len(ve))
+			for i, fe := range ve {
+				out[i] = ErrorMsg{fe.Field(), getErrorMsg(fe)}
+			}
+			ctx.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"errors": out})
+		}
+
 		return
 	}
 
 	email := request.Email
 
 	var users models.Users
-	db.Whop.First(&users, "email = ?", email)
+	err = db.Whop.First(&users, "email = ?", email).Error
 
-	isSame := isSame(request.Password, users.Password)
-
-	var response Response
-
-	if isSame {
-		response.Status = true
-		response.Message = "success"
-	} else {
-		response.Status = false
-		response.Message = "failed"
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		isValidUser = false
 	}
 
-	response.Data.AccessToken, err = generateJWT()
+	passwordIsSame := passwordIsSame(request.Password, users.Password)
+
+	if !passwordIsSame {
+		isValidUser = false
+	}
+
+	jwtToken, err = generateJWT()
 
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	ctx.JSON(200, response)
+	if isValidUser {
+		var response ResponseSuccess
+
+		response.Status = true
+		response.Message = "success"
+		response.Data.AccessToken = jwtToken
+
+		ctx.JSON(200, response)
+	} else {
+		//var response ResponseFailed
+		//
+		//response.Status = false
+		//response.Message = "Username or password isn't correct."
+
+		response := gin.H{
+			"status":  false,
+			"message": "Username or password isn't correct.",
+		}
+
+		ctx.JSON(200, response)
+	}
+
+}
+
+func getSimpleError() {
+
 }
 
 /*
@@ -81,7 +143,7 @@ func Hash(str string) (string, error) {
 }
 */
 
-func isSame(str string, hashed string) bool {
+func passwordIsSame(str string, hashed string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(str)) == nil
 }
 
